@@ -24,4 +24,5 @@ galaxy_info:
    - system
    - web
    - security
+   - ssl
 dependencies: []
