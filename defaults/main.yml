@@ -1,0 +1,24 @@
+---
+
+# Set of default values that can be overriden in each
+# letsencrypt_certificates definition. See the letsencrypt module
+# documentation for details on the meaning of these keys.
+letsencrypt_defaults:
+  dir: store/letsencrypt-test
+  email: 'admin@example.com'
+  host: letsencrypt.example.com
+  webroot: /var/www
+  min_days: 7
+  domains_key_size: 4096
+  user_key_size: 4096  
+  staging: yes
+
+  
+# A list of dictionnary suitable for the letsencrypt module.
+# Each item can be either a FQDN or a dict. See the letsencrypt module (the
+# domains option) for description of the keys.
+letsencrypt_certificates:
+  - domains:
+      - name: example.com
+        cn: yes        
+      - www.example.com

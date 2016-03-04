@@ -1,0 +1,63 @@
+---
+
+
+- name: Run letsencrypt stage 1
+  letsencrypt:
+    stage: 1
+    dir: '{{ item.dir | default(letsencrypt_defaults.dir) }}'
+    email: '{{ item.email | default(letsencrypt_defaults.email) }}'
+    user_key_size: '{{ item.user_key_size | default(letsencrypt_defaults.user_key_size) }}'    
+    host: '{{ item.host | default(letsencrypt_defaults.host) }}'
+    webroot: '{{ item.webroot | default(letsencrypt_defaults.webroot) }}'
+    min_days: '{{ item.min_days | default(letsencrypt_defaults.min_days) }}'    
+    domains: '{{ item.domains }}'
+    domains_key_size: '{{ item.domains_key_size | default(letsencrypt_defaults.domains_key_size) }}'
+    staging: '{{ item.staging | default(letsencrypt_defaults.staging) | default(True) }}'
+  register: le_challenges
+  connection: local
+  sudo: false
+  with_items: letsencrypt_certificates
+  
+- name: Create challenge directories on remote hosts
+  file:
+    path: '{{ item.1.webroot }}/.well-known/acme-challenge'
+    state: directory
+    recurse: yes
+  delegate_to: '{{ item.1.host }}'
+  when: item.0.changed
+  with_subelements:
+    - le_challenges.results
+    - challenge
+
+- name: Deploy challenge files on remote hosts
+  copy:
+    dest: '{{ item.1.webroot}}/{{ item.1.uri }}'
+    content: '{{ item.1.authkey }}'
+  delegate_to: '{{ item.1.host }}'
+  when: item.0.changed
+  with_subelements:
+    - le_challenges.results
+    - challenge
+
+- name: Run letsencrypt stage 2
+  letsencrypt:
+    stage: 2
+    dir: '{{ letsencrypt_certificates[item|int].dir | default(letsencrypt_defaults.dir) }}'
+    domains: '{{ letsencrypt_certificates[item|int].domains }}'
+  connection: local
+  sudo: false
+  when: le_challenges.results[item|int].changed
+  with_sequence:
+    start=0
+    end='{{ letsencrypt_certificates | default([]) | length - 1}}'
+
+- name: Remove challenge on remote hosts
+  file:
+    path: '{{ item.1.webroot}}/{{ item.1.uri }}'
+    state: absent
+  delegate_to: '{{ item.1.host }}'
+  when: item.0.changed
+  with_subelements:
+    - le_challenges.results
+    - challenge
+

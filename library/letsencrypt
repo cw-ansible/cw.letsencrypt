@@ -1,0 +1,726 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+"""
+# letsencrypt --- 
+
+"""
+
+# Copyright © 2016 Sébastien Gross <seb•ɑƬ•chezwam•ɖɵʈ•org>
+# Created: 2016-03-01
+# Last changed: 2016-03-04 14:41:26
+
+# This program is free software. It comes without any warranty, to
+# the extent permitted by applicable law. You can redistribute it
+# and/or modify it under the terms of the Do What The Fuck You Want
+# To Public License, Version 2, as published by Sam Hocevar. See
+# http://sam.zoy.org/wtfpl/COPYING for more details.
+
+
+__author__ = "Sébastien Gross"
+__copyright__ = """Copyright © 2016 Sébastien Gross <seb•ɑƬ•chezwam•ɖɵʈ•org>"""
+
+
+
+DOCUMENTATION = '''
+---
+module: letsencrypt
+author: Sebastien Gross
+version_added: "1.0"
+short_description: Generate Let's Encrypt certificates
+description:
+    - Generate domain key / csr pair ans request a Let's Encrypt issued
+      signed certificate.
+
+options:
+  dir:
+    required: false
+    default: .
+    description:
+      - Path to a working directory on the local machine (the one that runs
+        Ansible). All generated files are stored in that directory.
+
+  domains:
+    required: true
+    description:
+      - A list of domain definition. Each definition is either a FQDN or a
+        dict having following keys.
+      - C(name), the domain FQDN.
+      - C(cn), if C(true) this domain is the primary domain for the
+        certificate (the CN). Otherwise the domain is considered as an
+        alternate name.
+      - C(webroot), override the default C(webroot).
+      - C(host), override the default C(host).
+        
+  domains_key_size:
+    required: false
+    default: 4096
+    description:
+      - Length of the domain private key. The minimum size should be
+        2048. For better security use a 4096-bit key.
+      
+  email:
+    required: false
+    default: None
+    description:
+      - Mail contact attached to the user account certificate.
+      - An email is required during stage 1 if user certificate is not yet
+        registred on Let's Encrypt servers.
+
+  host:
+    required: false
+    default: None
+    description:
+      - The FQDN of the machine that runs the web server for current
+        C(domains). It is used in stage 1.5 to deploy Domain Validation
+        challenges. Thus the serveur must be reachable by Ansible.
+      
+  min_days:
+    required: false
+    default: 3
+    description:
+      - Minimum days before Let's Encrypt is query to reissue the C(domains)
+        certificate.
+      
+  stage:
+    required: false
+    default: 1
+    description:
+      - If C(stage) is C(1), user a new user registration is performed (if
+        not already done), C(domains) key and csr are generated and a Domain
+        Validation challenge is requested.
+      - If C(stage) is C(2), the Domain Validation challenge is tested and
+        on success, the certificate is issued.
+      
+  staging:
+    required: false
+    default: true
+    description:
+      - Run against the staging environment. Do not change it unless you
+        really want to generate production certificates. Be aware of rate
+        limitations.
+      
+  webroot:
+    required: false
+    default: None
+    description:
+      - Path of the web root directory on the C(host) server. Domain
+        Validation challenge are deployed under
+        C(webroot)/.well-known/acme-challenge/.
+
+'''
+
+EXAMPLES='''
+
+See the main.yml file provided with this module.
+
+'''
+
+import subprocess
+import json
+import os
+import urllib2
+import base64
+import binascii
+import time
+import hashlib
+import tempfile
+import re
+import copy
+import textwrap
+import datetime
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+
+
+
+class LetsEncrypt(object):
+    """Base class for LetsEncrypt certificates"""
+
+    class HTTPError(Exception):
+        def __init__(self, value):
+            self.value = value
+        def __str__(self):
+            return repr(self.value)
+
+    
+    def __init__(self, user_private='_user.key', user_public='_user.pub',
+                 user_header_json='_user.header.json', staging=True):
+        '''Create a new LetsEncrypt object. Location of user
+        identification can be changed using:
+
+        :param string user_private: path to user private key.
+        :param string user_public: path to user public key.
+
+        :param string user_header_json: path to json representation
+                                        of the user key.
+
+        :param bool staging: Run against staging environment.
+        '''
+        if staging is True:
+            self.CA = "https://acme-staging.api.letsencrypt.org"
+        else:
+            self.CA = "https://acme-v01.api.letsencrypt.org"
+        self.TERMS = "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf"
+        self.user_private = user_private
+        self.user_public = user_public
+        self.user_header_json = user_header_json
+        
+    def run(self, cmd):
+        '''Run cmd and return both stdout and stderr.'''
+        proc = subprocess.Popen(cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            cmd_str = ' '.join(pipes.quote(arg) for arg in cmd)
+            raise IOError('Running %s: %s'  % (cmd_str, err))
+        return out, err
+
+    def _b64(self, b):
+        '''Encode binary b into base64 JSON Web Token string.'''
+        return base64.urlsafe_b64encode(b).replace("=", "")
+
+    def get_nonce(self):
+        '''Get a nonce number from the CA.'''
+        nonce_req = urllib2.Request("{0}/directory".format(self.CA))
+        nonce_req.get_method = lambda : 'HEAD'
+
+        return urllib2.urlopen(nonce_req).headers['Replay-Nonce']
+
+    def get_header(self):
+        '''Read user key information in the header json file.'''
+        if os.path.exists(self.user_header_json):
+            with open(self.user_header_json, 'r') as fh:
+                self.header = json.loads(fh.read())
+                return self.header
+        self.header = None
+
+    def build_request(self, req_json):
+        '''Build a JSON body for a request.
+
+        :param dict req_json: the json body to be signed.
+
+        :returns: a json string to be send to the CA server.
+        :rtype: string
+        '''
+        req_raw = json.dumps(req_json, sort_keys=True, indent=4)
+        req_b64 = self._b64(req_raw)
+
+        req_protected = copy.deepcopy(self.header)
+        req_protected.update({"nonce": self.get_nonce()})
+        
+        req_protected64 = self._b64(json.dumps(req_protected, sort_keys=True, indent=4))
+        
+        req_file = tempfile.NamedTemporaryFile(dir=".",
+                                               prefix="reqister_",
+                                               suffix=".json")
+        req_file.write("{0}.{1}".format(req_protected64, req_b64))
+        req_file.flush()
+        
+        req_file_name = os.path.basename(req_file.name)
+        req_file_sig = tempfile.NamedTemporaryFile(dir=".",
+                                                   prefix="register_",
+                                                   suffix=".sig")
+        req_file_sig_name = os.path.basename(req_file_sig.name)
+        self.run(['openssl', 'dgst', '-sha256', '-sign', self.user_private,
+              '-out', req_file_sig_name, req_file_name])
+        req_file_sig.seek(0)
+        req_sig64 = self._b64(req_file_sig.read())
+        
+        req_file_sig.close()
+        req_file.close()
+        
+        req_data = json.dumps({
+            "header": self.header,
+            "protected": req_protected64,
+            "payload": req_b64,
+            "signature": req_sig64,
+        }, sort_keys=True, indent=4)
+    
+        return req_data
+
+
+    
+    
+    
+
+class LetsEncryptUser(LetsEncrypt):
+    '''Class to manage Let's Encrypt user ID.'''
+
+    def init(self, size=4096):
+        '''Initialize LetsEncryptUser with key of size bit. The user
+        keys are only generated if the files are not present on the
+        system.
+        '''
+        self.header = None
+
+        if not os.path.exists(self.user_private):
+            out, err = self.run(['openssl', 'genrsa', '%d' % size])
+            with open(self.user_private, 'w+') as fh:
+                fh.write(out)
+
+        if not os.path.exists(self.user_public):
+            out, err = self.run(['openssl', 'rsa', '-in',
+                                 self.user_private, '-pubout'])
+            with open(self.user_public, 'w+') as fh:
+                fh.write(out)
+        self.get_header()
+
+    def parse_user_pubkey(self):
+        '''Parse user public key and generate the header file.'''
+        out, err = self.run(['openssl', 'rsa', '-pubin', '-in',
+                             self.user_public, '-noout', '-text'])
+
+        pub_hex, pub_exp = re.search(
+            'Modulus(?: \((?:2048|4096) bit\)|)\:\s+00:([a-f0-9\:\s]+?)Exponent\: ([0-9]+)',
+            out, re.MULTILINE|re.DOTALL).groups()
+        pub_mod = binascii.unhexlify(re.sub('(\s|:)', '', pub_hex))
+        pub_mod64 = self._b64(pub_mod)
+        #
+        pub_exp = int(pub_exp)
+        pub_exp = '{0:x}'.format(pub_exp)
+        pub_exp = '0{0}'.format(pub_exp) if len(pub_exp) % 2 else pub_exp
+        pub_exp = binascii.unhexlify(pub_exp)
+        pub_exp64 = self._b64(pub_exp)
+        #
+        self.header = {
+            'alg': 'RS256',
+            'jwk': {
+                'e': pub_exp64,
+                'kty': 'RSA',
+                'n': pub_mod64,
+            },
+        }
+        if not os.path.exists(self.user_header_json):
+            with open(self.user_header_json, 'w+') as fh:
+                fh.write(json.dumps(self.header))
+        return self.header
+
+    def get_header(self):
+        super(LetsEncryptUser, self).get_header()
+        if self.header is None:
+            return self.parse_user_pubkey()
+
+    def register_user(self, email):
+        '''Register user public key and email to the CA server.'''
+        reg_nonce = self.get_nonce()
+    
+        req_json = {
+            "contact": ["mailto:{0}".format(email)],
+            "resource": "new-reg",
+            "agreement": self.TERMS,
+        }
+        reg_data = self.build_request(req_json)
+    
+        
+        reg_url = "{0}/acme/new-reg".format(self.CA)
+    
+        try:
+            resp = urllib2.urlopen(reg_url, reg_data)
+            result = json.loads(resp.read())
+        except urllib2.HTTPError as e:
+            err = json.loads(e.read())
+            if err['status'] == 409:
+                # skip already registered accounts
+                pass
+            else:
+                raise LetsEncryptUser.HTTPError(err['detail'])
+
+
+class LetsEncryptDomain(LetsEncrypt):
+    '''Class to manage Let's Encrypt Domain.'''
+
+    def init(self, domain, alternate=None):
+        '''Initialize LetsEncryptDomain object.
+
+        :param string domain: primary domain name.
+        :param array alternate: list of alternate domain names.
+        '''
+        self.domain = domain
+
+        self.private = '%s.key' % self.domain
+        self.csr = '%s.csr' % self.domain
+        self.pem = '%s.pem' % self.domain
+        self.domain_list = '%s.domains.txt' % self.domain
+        
+        self.alternate = alternate
+        
+    def generate_keys(self, size=4096, force=False):
+        '''Initialize LetsEncryptUser with key of size bit. The user
+        keys are only generated if the files are not present on the
+        system.
+        '''
+        if not os.path.exists(self.private):
+            out, err = self.run(['openssl', 'genrsa', '%d' % size])
+            with open(self.private, 'w+') as fh:
+                fh.write(out)
+
+        if not os.path.exists(self.csr):
+            _conf = tempfile.NamedTemporaryFile(dir=".",
+                                                prefix='%s' % self.domain,
+                                                suffix=".conf")
+
+            _conf_filename = os.path.basename(_conf.name)
+
+            # _conf.close()
+            # _conf_filename = '%s.conf' % self.domain
+            # _conf = open(_conf_filename, 'w+')
+            
+            _conf.write('''
+[req]
+req_extensions = v3_req
+distinguished_name = req_distinguished_name
+
+[ req_distinguished_name ]
+CN={0}
+
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+
+'''.format(self.domain))
+            
+            if type(self.alternate) == list and len(self.alternate) > 0:
+                _conf.write('subjectAltName = @alt_names\n')
+                _conf.write('[ alt_names ]\n')
+                for i in range(len(self.alternate)):
+                    _conf.write('DNS.{0} = {1}\n'.format(i+1, self.alternate[i]))
+            _conf.flush()
+            out, err = self.run(['openssl', 'req', '-new', '-sha256', '-subj',
+                                 '/CN={0}'.format(self.domain), '-key',
+                                 self.private, '-out', self.csr,
+                                 '-config', _conf_filename])
+
+
+    def get_alternate_from_csr(self):
+        '''Read alternate domain name from the csr file.'''
+        out, err = self.run(['openssl', 'req', '-in', self.csr, '-noout', '-text'])
+        #print out
+        domain_search = re.search("Subject:.*? CN=([^\s,;/]+)", out)
+        domain = None
+        self.header = self.get_header()
+        alternate = set([])
+        if domain_search is not None:
+            domain = domain_search.group(1)
+        alternate_search = re.search('X509v3 Subject Alternative Name: \n +([^\n]+)\n',
+                                     out, re.MULTILINE|re.DOTALL)
+        if alternate_search is not None:
+            for alt in alternate_search.group(1).split(", "):
+                if alt.startswith("DNS:"):
+                    alternate.add(alt[4:])
+
+        #print domain
+        self.alternate = alternate
+        
+    def _get_date_from_pem(self):
+        out, err = self.run(['openssl', 'x509', '-in', self.pem, '-noout', '-text'])
+        date_search = re.search('Not After *: +(.*)', out)
+        if date_search is not None:
+            not_after = datetime.datetime.strptime(date_search.group(1),
+                                                   '%b %d %H:%M:%S %Y %Z')
+        
+        return not_after
+
+    def get_validity(self):
+        self.valid_days = (self._get_date_from_pem() - datetime.datetime.now()).days
+
+    def gen_challenges(self):
+
+        self.get_header()
+
+        accountkey_json = json.dumps(self.header['jwk'],
+                                     sort_keys=True, separators=(',', ':'))
+        thumbprint = self._b64(hashlib.sha256(accountkey_json).digest())
+
+        domains = [ self.domain ]
+        if self.alternate is not None:
+            domains += self.alternate
+
+        ret = []
+        for domain in domains :
+            id_json = {
+                "resource": "new-authz",
+                "identifier": {
+                    "type": "dns",
+                    "value": domain,
+                }
+            }
+            id_data = self.build_request(id_json)
+    
+            id_url = "{0}/acme/new-authz".format(self.CA)
+            try:
+                resp = urllib2.urlopen(id_url, id_data)
+                result = json.loads(resp.read())
+            except urllib2.HTTPError as e:
+                err = json.loads(e.read())
+                raise LetsEncryptDomain.HTTPError(err['detail'])
+
+            challenge = [c for c in result['challenges'] if c['type'] == "http-01"][0]
+            keyauthorization = "{0}.{1}".format(challenge['token'], thumbprint)
+
+            test_json = {
+                "resource": "challenge",
+                "keyAuthorization": keyauthorization,
+            }
+            test_data = self.build_request(test_json)
+            test_data_json = json.loads(test_data)
+            
+            test_sig64 = test_data_json['signature']
+            test_protected64 = test_data_json['protected']
+            test_b64 = test_data_json['payload']
+    
+            resp_uri = ".well-known/acme-challenge/{0}".format(challenge['token'])
+    
+            
+            with open('%s.challenge.json' % domain, 'w+') as fh:
+                fh.write(json.dumps({
+                    "header": self.header,
+                    "protected": test_protected64,
+                    "payload": test_b64,
+                    "signature": test_sig64,
+                    'uri': challenge['uri'],
+                    }, sort_keys=True, indent=4))
+
+            ret.append({
+                'domain': domain,
+                'uri': resp_uri,
+                'authkey': keyauthorization
+                })
+                
+        return ret
+            
+
+
+    def verify_domain_challenge(self):
+        # VERIFY THE CHALLENGES
+        domains = set([self.domain]).union(self.alternate)
+        fh_domain = open(self.domain_list, 'w+')
+        for domain in domains:
+            with open('%s.challenge.json' % domain, 'r') as fh:
+                test_json = json.loads(fh.read())
+            
+            test_data = json.dumps({
+                "header": test_json['header'],
+                "protected": test_json['protected'],
+                "payload": test_json['payload'],
+                "signature": test_json['signature'],
+            }, sort_keys=True, indent=4)
+            test_url = test_json['uri']
+                
+            try:
+                resp = urllib2.urlopen(test_url, test_data)
+                test_result = json.loads(resp.read())
+            except urllib2.HTTPError as e:
+                err = json.loads(e.read())
+                raise LetsEncryptDomain.HTTPError(err['detail'])
+    
+            # Step 13: Wait for CA to mark test as valid
+            while True:
+                try:
+                    resp = urllib2.urlopen(test_url)
+                    challenge_status = json.loads(resp.read())
+                except urllib2.HTTPError as e:
+                    err = json.loads(e.read())
+                    raise LetsEncryptDomain.HTTPError(err['detail'])
+                if challenge_status['status'] == "pending":
+                    time.sleep(2)
+                elif challenge_status['status'] == "valid":
+                    break
+                else:
+                    raise KeyError(
+                        "'{0}' challenge did not pass: {1}".format(
+                            'domain', challenge_status))
+                
+            os.unlink('%s.challenge.json' % domain)
+            fh_domain.write('%s\n' % domain)
+            #os.unlink('%s.web.json' % domain)
+        fh_domain.close()
+        
+    def get_pem(self):
+        csr_der, err = self.run(["openssl", "req", "-in", self.csr, "-outform", "DER"])
+        csr_der64 = self._b64(csr_der)
+        
+        csr_json = {
+            "resource": "new-cert",
+            "csr": csr_der64,
+        }
+        csr_data = self.build_request(csr_json)
+
+        
+        csr_url = "{0}/acme/new-cert".format(self.CA)
+        try:
+            resp = urllib2.urlopen(csr_url, csr_data)
+            signed_der = resp.read()
+        except urllib2.HTTPError as e:
+                err = json.loads(e.read())
+                raise LetsEncryptDomain.HTTPError(err['detail'])
+
+
+        signed_pem = base64.b64encode(signed_der)
+        pem = ['-----BEGIN CERTIFICATE-----']
+        pem += textwrap.wrap(signed_pem, 64)
+        pem += [ '-----END CERTIFICATE-----' ]
+
+        
+        with open('%s.pem' % self.domain, 'w+') as fh:
+            fh.write('\n'.join(pem))
+        
+        return '\n'.join(pem)
+
+
+
+
+
+class LetsEncryptModule(AnsibleModule):
+
+    def __init__(self):
+        AnsibleModule.__init__(
+            self,
+            argument_spec = dict(
+                stage = dict(required = False, choices=[1, 2],
+                             default=1, type='int'),
+                staging = dict(required=False, type='bool', default=True),
+                domains = dict(required = True),
+                domains_key_size = dict(required = False,
+                                        default=4096, type='int'),
+                dir = dict(required = False, default='.'),
+                user_prefix = dict(required = False, default='_user'),
+                user_key_size = dict(required = False, default=4096,
+                                     type='int'),
+                email = dict(required=False),
+                min_days = dict(require=False, default=3, type='int'),
+                host = dict(required=False, default=None),
+                webroot = dict(required=False, default=None)
+            ),
+            supports_check_mode=True)
+
+        self.changed = False
+        self.msg = []
+        self.stdout = []
+        self.stderr = []
+
+        # Make sure directory exists
+        if not os.path.exists(self.params['dir']):
+            os.makedirs(self.params['dir'])
+            self.stdout.append('Created directory %s' % self.params['dir'])
+            self.changed = True
+
+        os.chdir(self.params['dir'])
+
+        self.user_private = '%s.key' % self.params['user_prefix']
+        self.user_public = '%s.pub' % self.params['user_prefix']
+        self.user_header_json = '%s.header.json' % self.params['user_prefix']
+
+
+        self.domain = None
+        self.alternate = []
+        domains = {}
+
+        for d in self.params['domains']:
+            if type(d) != dict:
+                d = { 'name': d }
+            if d.has_key('cn') and d['cn'] is True:
+                self.domain = d['name']
+            else:
+                self.alternate += [ d['name'] ]
+ 
+            if self.params['stage'] == 1:
+                # set default webroot/host if not defined/
+                for k in ['webroot', 'host']:
+                    if not d.has_key(k):
+                        if self.params[k] is None:
+                            self.fail_json(
+                                msg='"%s" is not defined for domain %d or as default.' % k)
+                        d[k] = self.params[k]
+                
+                d['webroot'] = d['webroot'].replace('%NAME%', d['name'])
+            domains[d['name']] = d 
+        self.params['domains'] = domains
+
+        try:
+            if self.params['stage'] == 1:
+                self.stage1()
+            if self.params['stage'] == 2:
+                self.stage2()
+        except LetsEncrypt.HTTPError, e:
+            self.fail_json(msg='%s' % e)
+        except Exception, e:
+            self.fail_json(msg='Something went wrong: %s' % e)
+            
+            
+    def stage1(self):
+        _p = self.params
+        
+        # Check user is defined
+        for f in [ self.user_private, self.user_public, self.user_header_json ]:
+            if os.path.exists(f):
+                continue
+            if _p['email'] is None:
+                self.fail_json(
+                    msg='"email" parameter is required for user registration.')
+                
+            user = LetsEncryptUser(user_private=self.user_private,
+                                   user_public=self.user_public,
+                                   user_header_json=self.user_header_json,
+                                   staging = _p['staging'])
+            user.init(size=_p['user_key_size'])
+            user.register_user(_p['email'])
+            self.msg += ['New user registred with email: %s.' % _p['email'] ]
+            self.changed = True
+            break
+        #
+        domain = LetsEncryptDomain(staging = _p['staging'])
+        domain.init(self.domain, alternate=self.alternate)
+        for f in [ domain.private, domain.csr ]:
+            if os.path.exists(f):
+                continue
+            domain.generate_keys(size=_p['domains_key_size'])
+            self.msg += ['New keys generated for: %s.' % self.domain ]
+            self.changed = True
+
+
+        challenge = []
+        if not os.path.exists(domain.pem):
+            challenge = domain.gen_challenges()
+        else:
+            domain.get_validity()
+            if domain.valid_days < _p['min_days'] or domain.valid_days < 0 :
+                self.msg += [ 'Domain "%s" expires in %d days (min %d)' %
+                              (self.domain, domain.valid_days, _p['min_days']) ]
+                challenge = domain.gen_challenges()
+                self.changed = True
+                
+        if challenge is not None:
+            for c in challenge:
+                c.update(_p['domains'][c['domain']])
+
+        self.exit_json(changed=self.changed,
+                       msg='\r\n'.join(self.msg),
+                       stdout='\r\n'.join(self.stdout),
+                       stderr='\r\n'.join(self.stderr),
+                       challenge=challenge)
+        
+        
+    def  stage2(self):
+        domain = LetsEncryptDomain(staging = self.params['staging'])
+        domain.init(self.domain)
+        domain.get_alternate_from_csr()
+        domain.verify_domain_challenge()
+        domain.get_pem()
+        self.changed = True
+
+        
+
+def main():
+    lem = LetsEncryptModule()
+
+    lem.exit_json(changed=lem.changed,
+                 msg='\r\n'.join(lem.msg),
+                 stdout='\r\n'.join(lem.stdout),
+                 stderr='\r\n'.join(lem.stderr))
+    
+
+main()
