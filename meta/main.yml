@@ -1,0 +1,27 @@
+galaxy_info:
+  author: Sébastien Gross
+  description: "Full automated Let's Encrypt certificate generation"
+  license: WTFPL
+  min_ansible_version: 1.9
+  platforms:
+    - name: Ubuntu
+      versions:
+        - precise
+        - quantal
+        - raring
+        - saucy
+        - trusty
+        - utopic
+        - vivid
+    - name: Debian
+      versions:
+        - jessie
+        - lenny
+        - squeeze
+        - wheezy
+  categories:
+   - development
+   - system
+   - web
+   - security
+dependencies: []
