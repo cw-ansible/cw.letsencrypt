@@ -44,6 +44,7 @@
     stage: 2
     dir: '{{ letsencrypt_certificates[item|int].dir | default(letsencrypt_defaults.dir) }}'
     domains: '{{ letsencrypt_certificates[item|int].domains }}'
+    staging: '{{ item.staging | default(letsencrypt_defaults.staging) | default(True) }}'
   connection: local
   sudo: false
   when: le_challenges.results[item|int].changed
